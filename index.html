@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Weboscoket MQTT Demo</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/keycloak-js@latest/dist/keycloak.min.js"></script>
+  <script>
+    // Initialize Keycloak
+    const keycloak = new Keycloak({
+      url: 'https://meters.osys.it/auth/',
+      realm: 'WebChatDemo',
+      clientId: 'webchatdemo'
+    });
+  </script>
+</head>
+
+<body>
+   
+  <h1>DEMO Use WebSocket client to connect to MQTT server (<a href="https://github.com/dometec/MQTTDemoWebChat">GitHub</a>)</h1>
+  
+  <div style="margin: 20px; display: flex; justify-content: space-between; align-items: center;">
+    <span id="userDisplay" style="font-weight: bold;"></span>
+    <div style="display: flex; align-items: center; gap: 8px; position: absolute; left: 50%; transform: translateX(-50%);">
+      <input type="text" id="welcomeMessage" placeholder="Set your welcome message" style="padding: 8px; border: 1px solid #ddd; border-radius: 4px; width: 300px;">
+      <button onclick="setWelcomeMessage()" style="padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Set Welcome</button>
+    </div>
+    <button onclick="logout()" style="padding: 8px 16px; background-color: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer;">Logout</button>
+  </div>
+
+  <hr/>
+
+  <div style="display: flex; gap: 20px; margin: 20px;">
+
+    <div style="flex: 1;">
+      <h3>Members</h3>
+      <table id="membersTable" style="width: 100%; border-collapse: collapse;">
+        <thead>
+          <tr>
+            <th style="border: 1px solid #ddd; padding: 8px;">Username</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Status</th>
+          </tr>
+        </thead>
+        <tbody id="membersTableBody">
+        </tbody>
+      </table>
+    </div>
+
+    <div style="flex: 1;">
+      <h3>Public Channels</h3>
+      <div style="margin-bottom: 10px;">
+        <input type="text" id="newChannel" placeholder="New channel name">
+        <button onclick="createChannel()">Create</button>
+      </div>
+      <table id="channelsTable" style="width: 100%; border-collapse: collapse;">
+        <thead>
+          <tr>
+            <th style="border: 1px solid #ddd; padding: 8px;">Channel</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">Welcome Message</th>
+          </tr>
+        </thead>
+        <tbody id="channelsTableBody">
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <hr/>
+  
+  <div id="chatDiv" style="display: none; margin: 20px; border: 1px solid #ddd; padding: 10px;">
+    <div id="chatTabs" style="display: flex; border-bottom: 1px solid #ddd; margin-bottom: 10px;">
+      <!-- Tabs will be added here dynamically -->
+    </div>
+    <div id="chatContent">
+      <div id="chatHeader" style="padding: 10px; background-color: #f5f5f5; border-bottom: 1px solid #ddd; margin-bottom: 10px; font-style: italic;"></div>
+      <div id="chatMessages" style="height: 200px; overflow-y: auto; border: 1px solid #ddd; margin-bottom: 10px; padding: 10px;"></div>
+      <div>
+        <input type="text" id="chatMessage" style="width: 80%; padding: 5px;" onkeypress="if(event.key === 'Enter') { sendChatMessage(); document.getElementById('chatMessage').focus(); }">
+        <button onclick="sendChatMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+
+</body>
+
+<script>
+ 
+    // Create a map to store member statuses
+    const memberStatuses = new Map();
+
+    const channelStatuses = new Map();
+
+    // Stores chat content for each tab
+    const activeChats = new Map(); 
+
+    // Welcome message degli utenti
+    const usersWelcomeMessage = new Map(); 
+
+    let currentChatUser = null;
+    let currentChannel = null;
+    let mqttClient = null;
+
+    function createTab(name, isChannel = false) {
+        const tab = document.createElement('div');
+        tab.className = 'chat-tab';
+        tab.style.padding = '8px 16px';
+        tab.style.cursor = 'pointer';
+        tab.style.border = '1px solid #ddd';
+        tab.style.borderBottom = 'none';
+        tab.style.marginRight = '5px';
+        tab.style.backgroundColor = '#f1f1f1';
+        
+        const tabName = document.createElement('span');
+        tabName.textContent = isChannel ? `#${name}` : name;
+        
+        const closeButton = document.createElement('span');
+        closeButton.innerHTML = ' &times;';
+        closeButton.style.marginLeft = '8px';
+        closeButton.style.cursor = 'pointer';
+        closeButton.onclick = (e) => {
+            e.stopPropagation();
+            closeTab(name, isChannel);
+        };
+        
+        tab.appendChild(tabName);
+        tab.appendChild(closeButton);
+        
+        tab.onclick = () => switchTab(name, isChannel);
+        
+        return tab;
+    }
+
+    function switchTab(name, isChannel) {
+        const tabs = document.querySelectorAll('.chat-tab');
+        tabs.forEach(tab => {
+            tab.style.backgroundColor = '#f1f1f1';
+        });
+        
+        const currentTab = Array.from(tabs).find(tab => 
+            tab.textContent.trim() === (isChannel ? `#${name}` : name)
+        );
+        if (currentTab) {
+            currentTab.style.backgroundColor = '#fff';
+        }
+        
+        if (isChannel) {
+            currentChannel = name;
+            currentChatUser = null;
+        } else {
+            currentChatUser = name;
+            currentChannel = null;
+        }
+        
+        updateChatContent();
+    }
+
+    function closeTab(name, isChannel) {
+        const tabContainer = document.getElementById('chatTabs');
+        const tab = Array.from(tabContainer.children).find(tab => 
+            tab.textContent.trim() === (isChannel ? `#${name}` : name)
+        );
+        if (tab) {
+            tabContainer.removeChild(tab);
+            activeChats.delete(isChannel ? `channel_${name}` : `user_${name}`);
+            
+            if (isChannel && currentChannel === name) {
+                currentChannel = null;
+            } else if (!isChannel && currentChatUser === name) {
+                currentChatUser = null;
+            }
+            
+            if (tabContainer.children.length === 0) {
+                document.getElementById('chatDiv').style.display = 'none';
+            } else {
+                // Switch to the first available tab
+                const firstTab = tabContainer.firstChild;
+                const tabName = firstTab.textContent.trim();
+                const isFirstTabChannel = tabName.startsWith('#');
+                switchTab(isFirstTabChannel ? tabName.substring(1) : tabName, isFirstTabChannel);
+            }
+        }
+    }
+
+    function updateChatContent() {
+
+        // Display welcome message in header
+        if (currentChatUser != undefined) {
+            const welcomeMsg = usersWelcomeMessage.get(currentChatUser) || 'No welcome message set';
+            document.getElementById('chatHeader').textContent = `Welcome message: "${welcomeMsg}"`;
+        }
+        
+        if (currentChannel != undefined) {
+            const welcomeMsg = channelStatuses.get(currentChannel) || 'No welcome message set';
+            document.getElementById('chatHeader').textContent = `Welcome message: "${welcomeMsg}"`;
+        }
+
+        const chatMessages = document.getElementById('chatMessages');
+        chatMessages.innerHTML = '';
+        
+        const chatKey = currentChannel ? `channel_${currentChannel}` : `user_${currentChatUser}`;
+        const messages = activeChats.get(chatKey) || [];
+        
+        messages.forEach(msg => {
+            const messageDiv = document.createElement('div');
+            messageDiv.textContent = msg;
+            chatMessages.appendChild(messageDiv);
+        });
+        
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    function addMessageToChat(message, isChannel = false, name) {
+        const chatKey = isChannel ? `channel_${name}` : `user_${name}`;
+        if (!activeChats.has(chatKey)) {
+            activeChats.set(chatKey, []);
+        }
+        activeChats.get(chatKey).push(message);
+        
+        if ((isChannel && currentChannel === name) || (!isChannel && currentChatUser === name)) {
+            updateChatContent();
+        }
+    }
+
+    // Apre il tab per chattare con questo utente, nello stesso momento 
+    // mi sottoscrivo al welcome message dello stesso utente
+    // cosi, se non lo avevo ricevuto prima, lo faccio apparire come
+    // primo messaggio
+    function openChat(username) {
+        console.log('Subscribing to topic: welcome/' + username);
+
+        mqttClient.subscribe("welcome/" + username, {qos: 1});
+
+        if (!activeChats.has(`user_${username}`)) {
+            const tabContainer = document.getElementById('chatTabs');
+            const tab = createTab(username);
+            tabContainer.appendChild(tab);
+            activeChats.set(`user_${username}`, []);
+        }
+        
+        switchTab(username, false);
+        document.getElementById('chatDiv').style.display = 'block';
+    }
+
+    function joinChannel(channelName) {
+        if (!activeChats.has(`channel_${channelName}`)) {
+            const tabContainer = document.getElementById('chatTabs');
+            const tab = createTab(channelName, true);
+            tabContainer.appendChild(tab);
+            activeChats.set(`channel_${channelName}`, []);
+        }
+        
+        switchTab(channelName, true);
+
+        document.getElementById('chatDiv').style.display = 'block';
+        
+        const username = keycloak.tokenParsed.preferred_username;
+        const topic = `chat/public/${channelName}/+/messages`;
+        console.log('Subscribing to topic: ', topic);
+        mqttClient.subscribe(topic, {qos: 1}, (err, granted) => {
+            if (err) {
+                console.log('Subscribe error: ', err);
+            } else {
+                console.log('Subscribe granted: ', granted);
+            }
+        });
+
+    }
+
+    function sendChatMessage() {
+        
+        if ((!currentChatUser && !currentChannel) || !mqttClient) return;
+        
+        const username = keycloak.tokenParsed.preferred_username;
+        const message = document.getElementById('chatMessage').value;
+        if (!message) return;
+        
+        let topic;
+        let isChannel = false;
+        if (currentChannel) {
+            topic = `chat/public/${currentChannel}/${username}/messages`;
+            isChannel = true;
+        } else {
+            topic = `chat/private/${username}/${currentChatUser}/messages`;
+        }
+        
+        console.log('Publishing to topic: ' + topic + ' message: ' + message);
+        mqttClient.publish(topic, message, {qos: 1});
+        
+        addMessageToChat(message, false, currentChatUser);
+
+        document.getElementById('chatMessage').value = '';
+        document.getElementById('chatMessage').focus();
+    }
+
+    function updateMembersTable() {
+        const tbody = document.getElementById('membersTableBody');
+        tbody.innerHTML = '';
+        
+        const currentUser = keycloak.tokenParsed.preferred_username;
+        
+        memberStatuses.forEach((status, username) => {
+            // Skip the current user
+            if (username === currentUser) return;
+            
+            const row = document.createElement('tr');
+            row.style.cursor = 'pointer';
+            row.onclick = () => openChat(username);
+            
+            const usernameCell = document.createElement('td');
+            usernameCell.style.border = '1px solid #ddd';
+            usernameCell.style.padding = '8px';
+            usernameCell.textContent = username;
+            
+            const statusCell = document.createElement('td');
+            statusCell.style.border = '1px solid #ddd';
+            statusCell.style.padding = '8px';
+            statusCell.textContent = status;
+            statusCell.style.color = status === 'online' ? 'green' : 'red';
+            statusCell.style.fontWeight = 'bold';
+            
+            row.appendChild(usernameCell);
+            row.appendChild(statusCell);
+            tbody.appendChild(row);
+        });
+    }
+
+    function updateChannelTable() {
+        const tbody = document.getElementById('channelsTableBody');
+        tbody.innerHTML = '';
+        
+        channelStatuses.forEach((status, channelName) => {
+            const row = document.createElement('tr');
+            
+            const channelCell = document.createElement('td');
+            channelCell.style.border = '1px solid #ddd';
+            channelCell.style.padding = '8px';
+            channelCell.textContent = channelName;
+            
+            const statusCell = document.createElement('td');
+            statusCell.style.border = '1px solid #ddd';
+            statusCell.style.padding = '8px';
+            statusCell.textContent = status;
+            
+            const actionCell = document.createElement('td');
+            actionCell.style.border = '1px solid #ddd';
+            actionCell.style.padding = '8px';
+            
+            const joinButton = document.createElement('button');
+            joinButton.textContent = 'Join';
+            joinButton.onclick = () => joinChannel(channelName);
+            
+            actionCell.appendChild(joinButton);
+            row.appendChild(channelCell);
+            row.appendChild(statusCell);
+            row.appendChild(actionCell);
+            tbody.appendChild(row);
+        }); 
+    } 
+
+    function connectMQTT() { 
+
+        if (!keycloak.authenticated) {
+            keycloak.login();
+            return;
+        }
+
+        const username = keycloak.tokenParsed.preferred_username;
+        const clientId = 'mqttjs_' + username + '_web';
+        const host = 'wss://meters.osys.it/mqtt';
+        const options = {  
+          username: username,
+          password: keycloak.token,  // Use Keycloak token as password
+          keepalive: 60,
+          clientId: clientId,  
+          protocolId: 'MQTT',
+          protocolVersion: 4,
+          clean: false,
+          reconnectPeriod: 15000,
+          connectTimeout: 30 * 1000,
+          will: {
+              topic: 'onlinestatus/' + username,
+              payload: 'offline',
+              qos: 0,
+              retain: true
+          },
+        };
+
+        console.log('Connecting mqtt client with username:', username);
+
+        mqttClient = mqtt.connect(host, options);
+        
+        // Set up token refresh
+        const refreshToken = () => {
+            keycloak.updateToken(70)  // Refresh token if it will expire in less than 70 seconds
+                .then(function(refreshed) {
+                    if (refreshed) {
+                        console.log('Token was refreshed');
+                        // Update MQTT connection with new token
+                        if (mqttClient && mqttClient.connected) {
+                            mqttClient.end();
+                            connectMQTT();  // Reconnect with new token
+                        }
+                    }
+                })
+                .catch(function() {
+                    console.error('Failed to refresh token');
+                    // Redirect to login if token refresh fails
+                    keycloak.login();
+                });
+        };
+
+        // Set up periodic token refresh
+        setInterval(refreshToken, 60000);  // Check token every minute
+        
+        mqttClient.on('error', (err) => {
+            console.log('Connection error: ', err);
+            mqttClient.end();
+        });
+
+        mqttClient.on('reconnect', () => {
+            mqttClient.publish("onlinestatus/" + username, "online", {qos: 0, retain: true});
+            console.log('Reconnecting...');
+        });
+
+        mqttClient.on("message", (topic, message) => {
+            console.log(topic.toString());
+            console.log(message.toString());
+            
+            if (topic.startsWith('onlinestatus/')) {
+                const username = topic.split('/')[1];
+                const status = message.toString();
+                memberStatuses.set(username, status);
+                updateMembersTable();
+
+            } else if (/^chat\/public\/.*\/welcome$/.test(topic)) {
+                const channelName = topic.split('/')[2];
+                const welcomeMessage = message.toString();
+                channelStatuses.set(channelName, welcomeMessage);
+                updateChannelTable();
+
+            } else if (/^chat\/public\/.*\/.*\/messages$/.test(topic)) {
+                const channel = topic.split('/')[2];
+                const sender = topic.split('/')[3];
+                addMessageToChat(`${sender}: ${message.toString()}`, true, channel);
+
+            } else if (/^chat\/private\/.*\/.*\/messages$/.test(topic)) {
+                const sender = topic.split('/')[2];
+                openChat(sender);
+                addMessageToChat(`${message.toString()}`, false, sender);
+
+            } else if (/^welcome\/.*$/.test(topic)) {
+                const user = topic.split('/')[1];
+                // se lo user sono io, imposto nella mia casella di testo il messaggio,
+                // altrimenti lo metto in una mappa
+                if (user === username) {
+                    document.getElementById('welcomeMessage').value = message.toString();
+                } else {
+                    usersWelcomeMessage.set(user, message.toString());
+                    updateChatContent();
+                }
+
+            }
+        });
+
+        mqttClient.publish("onlinestatus/" + username, "online", {qos: 0, retain: true});
+
+        // Resupero tutti gli utenti del sistema con il relativo stato
+        mqttClient.subscribe("onlinestatus/+", {qos: 0});
+
+        // Mi sottoscrivo al mio welcome message per ripopolare la casella di testo
+        mqttClient.subscribe("welcome/" + username, {qos: 0});
+
+        // Resupero tutti i canali del sistema con il relativo welcome message
+        mqttClient.subscribe("chat/public/+/welcome", {qos: 0});
+        
+        // Quando ricevo messaggi direttamente da un utente in modo privato
+        mqttClient.subscribe("chat/private/+/" + username + "/messages", {qos: 1});
+
+    }
+
+    function createChannel() {
+        const channelName = document.getElementById('newChannel').value.trim();
+        if (channelName && !channelStatuses.has(channelName)) {
+            const welcomeMessage = prompt("Enter welcome message for the channel:");
+            if (welcomeMessage !== null) {  // Check if user didn't cancel
+                document.getElementById('newChannel').value = '';
+                if (mqttClient) {
+                    mqttClient.publish(`chat/public/${channelName}/welcome`, welcomeMessage, {qos: 0, retain: true});
+                }
+            }
+        }
+    }
+
+    // Add logout function
+    function logout() {
+        if (mqttClient && mqttClient.connected) {
+            const username = keycloak.tokenParsed.preferred_username;
+            mqttClient.publish(`onlinestatus/${username}`, username, {qos: 0, retain: true});
+            mqttClient.end();
+        }
+        keycloak.logout();
+    }
+
+    // Add welcome message function
+    function setWelcomeMessage() {
+        if (!mqttClient || !mqttClient.connected) return;
+        
+        const username = keycloak.tokenParsed.preferred_username;
+        const message = document.getElementById('welcomeMessage').value;
+        if (!message) return;
+        
+        mqttClient.publish(`welcome/${username}`, message, {qos: 0, retain: true});
+    }
+
+    // Load saved username when page loads
+    window.onload = function() {
+        // Initialize Keycloak
+        keycloak.init({ onLoad: 'check-sso' })
+            .then(function(authenticated) {
+                console.log('Keycloak initialized:', authenticated);
+                if (authenticated) {
+                    // User is authenticated
+                    console.log('User is authenticated');
+                    // You can access user info with keycloak.tokenParsed
+                    console.log('User info:', keycloak.tokenParsed);
+                    
+                    // Display username
+                    document.getElementById('userDisplay').textContent = `Welcome, ${keycloak.tokenParsed.preferred_username}`;
+                    
+                    // Auto-connect if authenticated
+                    connectMQTT();
+                } else {
+                    // User is not authenticated, redirect to login
+                    keycloak.login();
+                }
+            })
+            .catch(function(error) {
+                console.error('Failed to initialize Keycloak:', error);
+            });
+    };
+
+</script>
+
+</html>
+
+
